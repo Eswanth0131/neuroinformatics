@@ -1,1 +1,1 @@
-# neuroinformatics
+# Neuroinformatics
