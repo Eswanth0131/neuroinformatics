@@ -1,0 +1,7 @@
+kaggle
+nibabel
+matplotlib
+numpy
+pandas
+torch
+
