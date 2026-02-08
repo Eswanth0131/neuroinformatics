@@ -84,12 +84,18 @@ class myDataset(Dataset):
 
     def __getitem__(self, index):
         # input, target
-        return self.dataset.iloc[index]['img_l'], self.dataset.iloc[index]['img_h']
+        input_img = self.dataset.iloc[index]['img_l']
+        target_img = self.dataset.iloc[index]['img_h']
+        input_img = input_img[np.newaxis, :]
+        target_img = target_img[np.newaxis, :]
+        # print(type(input_img))
+
+        # return input_img, target_img
+        return input_img.astype(np.float32), target_img.astype(np.float32)
 
 
 if __name__ == "__main__":
     """
-    'python main.py' to just see 1 low image vs 5 high images
     'python main.py 1' to just see 1 low image vs 1 high images randomly, after matching
     'python main.py 2' to just see 1 low image vs 1 high images randomly, with force reloading data
     'python main.py 3' to run piplines
@@ -118,15 +124,15 @@ if __name__ == "__main__":
 
     elif len(sys.argv) == 2:
         # NOTE: There are no target labels for the kaggle test dataset
-        data_path = './data.pkl'
+        data_path = './data/misc/data.pkl'
         print(os.getcwd(), not os.path.exists(data_path))
-        if not os.path.exists(data_path) or sys.argv[1] == 2:
+        if not os.path.exists(data_path) or sys.argv[1] == '2':
             data_df = create_dataframe()
             data_df.to_pickle(data_path)
         else:
             data_df = pd.read_pickle(data_path)
 
-        if sys.argv[1] == 1 or sys.argv[1] == 2:
+        if sys.argv[1] == '1' or sys.argv[1] == '2':
             train_dataset = myDataset(data_df)
             test_dataset = myDataset(data_df, 'test')
             
@@ -139,6 +145,15 @@ if __name__ == "__main__":
             ax[1].imshow(targets[0])
             plt.show()
 
-        elif sys.argv[1] == 3:
+        elif sys.argv[1] == '3':
+            train_dataset = myDataset(data_df)
+            test_dataset = myDataset(data_df, 'test')
+            
+            train_loader = DataLoader(train_dataset, batch_size=10, shuffle=True)
+            test_loader = DataLoader(test_dataset, batch_size=10, shuffle=True)
+            for batch, (X, y) in enumerate(train_loader):
+                print(batch)
+                print(X.shape, y.shape)
+                print(X.shape, type(X))
 
             pass
