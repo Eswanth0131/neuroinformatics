@@ -1,7 +1,35 @@
+import pandas as pd
+from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from main import *
+PATH = './'
+class UpsampleCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU()
+        )
+        
+        self.decoder = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 1, 3, padding=1)
+        )
 
+    def forward(self, x):
+        x = self.encoder(x)
+        
+        # Resize to exact target size
+        x = F.interpolate(x, size=(179, 221), mode='bicubic', align_corners=False)
+        
+        x = self.decoder(x)
+        return x
 
 class ResidualBlock(nn.Module):
     """Residual block with two convolutional layers"""
@@ -48,7 +76,7 @@ class ImageUpscaler(nn.Module):
         num_residual_blocks: Number of residual blocks (default: 16)
         base_channels: Number of feature channels (default: 64)
     """
-    def __init__(self, scale_factor=2, num_channels=3, num_residual_blocks=16, base_channels=64):
+    def __init__(self, scale_factor=2, num_channels=1, num_residual_blocks=16, base_channels=64):
         super(ImageUpscaler, self).__init__()
         
         self.scale_factor = scale_factor
@@ -79,6 +107,9 @@ class ImageUpscaler(nn.Module):
         
         # Output convolution
         self.conv_output = nn.Conv2d(base_channels, num_channels, kernel_size=9, padding=4)
+
+        # fix output size
+        # self.conv_output_sized = nn.Conv2d(base_channels, num_channels, kernel_size=9, padding=4)
         
     def forward(self, x):
         # Store input for final skip connection
@@ -101,27 +132,80 @@ class ImageUpscaler(nn.Module):
         
         # Final output
         out = self.conv_output(out)
+        # out = self.conv_output_sized(out)
         
         # Add bicubic upsampled input (helps with training)
         out += input_upsampled
+        out = F.interpolate(out, size=(179, 221), mode='bicubic', align_corners=False)
         
         return out
 
+def train_loop(dataloader, device, model, loss_fn, optimizer, batch_size=10, ):
+    size = len(dataloader.dataset)
+    # Set the model to training mode - important for batch normalization and dropout layers
+    # Unnecessary in this situation but added for best practices
+    model.train()
+    for batch, (X, y) in enumerate(dataloader):
+        # Compute prediction and loss
+        # x_float = X.to(torch.float)
+        # print(x_float.shape, y.shape)
+        # pred = model(x_float)
+        pred = model(X.to(device))
+        # print(x_float.shape, pred.shape, y.shape)
+        # loss = loss_fn(pred, y.to(torch.float))
+        loss = loss_fn(pred, y.to(device))
+        
+
+        # Backpropagation
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        if batch % 100 == 0:
+            loss, current = loss.item(), batch * batch_size + len(X)
+            print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
+
+def test_loop(dataloader, device, model, loss_fn):
+    # Set the model to evaluation mode - important for batch normalization and dropout layers
+    # Unnecessary in this situation but added for best practices
+    model.eval()
+    size = len(dataloader.dataset)
+    num_batches = len(dataloader)
+    test_loss, correct = 0, 0
+
+    # Evaluating the model with torch.no_grad() ensures that no gradients are computed during test mode
+    # also serves to reduce unnecessary gradient computations and memory usage for tensors with requires_grad=True
+    with torch.no_grad():
+        for X, y in dataloader:
+            pred = model(X.to(device))
+            test_loss += loss_fn(pred, y.to(device)).item()
+            # correct += (pred.argmax(1) == y.to(device)).type(torch.float).sum().item()
+
+    test_loss /= num_batches
+    correct /= size
+    print(f"Test Error: \n Accuracy: {(100*correct):>0.1f}%, Avg loss: {test_loss:>8f} \n")
 
 # Example usage and training setup
 if __name__ == "__main__":
     # Create model
-    model = ImageUpscaler(scale_factor=2, num_channels=3, num_residual_blocks=8, base_channels=64)
+    model = ImageUpscaler(scale_factor=2, num_channels=1, num_residual_blocks=8, base_channels=64)
+    # model = UpsampleCNN()
     
     # Example input (batch_size=4, channels=3, height=64, width=64)
-    input_image = torch.randn(4, 3, 64, 64)
-    
+    # input_image = torch.randn(4, 3, 64, 64)
+    dataset = pd.read_pickle('./data/misc/data.pkl')
+    input_image = dataset.loc[0, 'img_l']
+    train_dataset = myDataset(dataset)
+    test_dataset = myDataset(dataset, 'test')
+
+    train_loader = DataLoader(train_dataset, batch_size=10, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=10, shuffle=True)
+
     # Forward pass
-    output_image = model(input_image)
-    
-    print(f"Input shape: {input_image.shape}")
-    print(f"Output shape: {output_image.shape}")
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    # output_image = model(input_image)
+    # print(f"Input shape: {input_image.shape}")
+    # print(f"Output shape: {output_image.shape}")
+    # print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # Training setup example
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -134,26 +218,35 @@ if __name__ == "__main__":
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     
     # Training loop example
-    model.train()
-    for epoch in range(1):  # Just one example epoch
-        # Assuming you have low_res and high_res images
-        low_res = torch.randn(4, 3, 64, 64).to(device)
-        high_res = torch.randn(4, 3, 128, 128).to(device)  # 2x upscaled
-        
-        # Forward pass
-        output = model(low_res)
-        loss = criterion(output, high_res)
-        
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
-        print(f"Epoch {epoch+1}, Loss: {loss.item():.6f}")
+    # model.train()
+    # for epoch in range(1):  # Just one example epoch
+    #     for i, data in enumerate(train_loader, 0):
+    #         # Assuming you have low_res and high_res images
+    #         low_res = data[0].to(device)
+    #         high_res = torch.randn(4, 3, 128, 128).to(device)  # 2x upscaled
+            
+    #         # Forward pass
+    #         output = model(low_res)
+    #         loss = criterion(output, high_res)
+            
+    #         # Backward pass
+    #         optimizer.zero_grad()
+    #         loss.backward()
+    #         optimizer.step()
+            
+    #     print(f"Epoch {epoch+1}, Loss: {loss.item():.6f}")
     
-    # Inference example
-    model.eval()
-    with torch.no_grad():
-        test_input = torch.randn(1, 3, 128, 128).to(device)
-        upscaled = model(test_input)
-        print(f"\nInference - Input: {test_input.shape}, Output: {upscaled.shape}")
+    epochs = 200
+    for t in range(epochs):
+        print(f"Epoch {t+1}\n-------------------------------")
+        train_loop(train_loader, device, model, criterion, optimizer)
+        test_loop(test_loader, device, model, criterion)
+    print("Done!")
+    torch.save(model.state_dict(), os.path.join(PATH, 'model1.pt'))
+
+    # # Inference example
+    # model.eval()
+    # with torch.no_grad():
+    #     test_input = torch.randn(1, 3, 128, 128).to(device)
+    #     upscaled = model(test_input)
+    #     print(f"\nInference - Input: {test_input.shape}, Output: {upscaled.shape}")
