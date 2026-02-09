@@ -1,7 +1,6 @@
 MODELS = {}
 
 def register(name):
-    """Decorator to register a model class by name."""
     def decorator(cls):
         MODELS[name] = cls
         return cls
@@ -13,6 +12,6 @@ def get_model(name, **kwargs):
         raise ValueError(f"Unknown model '{name}'. Available: {available}")
     return MODELS[name](**kwargs)
 
-# Import all model files so they self-register
 from . import unet
 from . import unet_v2
+from . import swinir
