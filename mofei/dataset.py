@@ -170,18 +170,33 @@ def get_dataloaders(
     data_dir: str,
     cache_dir: str = None,
     val_subjects: int = 2,
+    val_start: int = -1,
     batch_size: int = 32,
     num_workers: int = 4,
     augment: bool = True,
 ):
+    """
+    val_start: index of first val subject. -1 means last val_subjects.
+    e.g. val_start=0, val_subjects=2 holds out subjects 0,1
+         val_start=8, val_subjects=2 holds out subjects 8,9
+         val_start=-1, val_subjects=2 holds out last 2 (default)
+    """
     volumes = preprocess_train(data_dir, cache_dir)
 
-    train_vols = volumes[:-val_subjects] if val_subjects > 0 else volumes
-    val_vols = volumes[-val_subjects:] if val_subjects > 0 else []
+    if val_subjects > 0:
+        if val_start < 0:
+            val_start = len(volumes) - val_subjects
+        val_end = val_start + val_subjects
+        val_vols = volumes[val_start:val_end]
+        train_vols = volumes[:val_start] + volumes[val_end:]
+    else:
+        train_vols = volumes
+        val_vols = []
 
     print(f"Train: {len(train_vols)} subjects ({len(train_vols)*200} slices)")
     if val_vols:
-        print(f"Val:   {len(val_vols)} subjects ({len(val_vols)*200} slices)")
+        val_ids = [v["sample_id"] for v in val_vols]
+        print(f"Val:   {len(val_vols)} subjects ({val_ids})")
 
     train_ds = SliceDataset(train_vols, augment=augment)
     train_loader = torch.utils.data.DataLoader(

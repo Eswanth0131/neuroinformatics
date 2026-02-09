@@ -25,7 +25,10 @@ from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DataParallel
 
 from dataset import get_dataloaders
+from dataset_25d import get_dataloaders_25d
 from models import get_model
+
+IS_25D_MODELS = {"unet_25d", "smp_unet_25d", "nafnet_25d"}  # models that need multi-slice input
 
 
 # ─── Loss Components ──────────────────────────────────────────────────────────
@@ -182,6 +185,8 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--val_subjects", type=int, default=0,
                         help="0 = train on all data (competition mode)")
+    parser.add_argument("--val_start", type=int, default=-1,
+                        help="Index of first val subject. -1 = last N")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--resume", type=str, default=None)
@@ -190,6 +195,7 @@ def main():
     parser.add_argument("--l1_w", type=float, default=0.3)
     parser.add_argument("--edge_w", type=float, default=0.15)
     parser.add_argument("--fft_w", type=float, default=0.15)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -197,14 +203,28 @@ def main():
 
     # Data
     print(f"Loading data from {args.data_dir}...")
-    train_loader, val_loader = get_dataloaders(
-        args.data_dir,
-        cache_dir=args.cache_dir,
-        val_subjects=args.val_subjects,
-        batch_size=args.batch_size,
-        num_workers=args.workers,
-        augment=True,
-    )
+    use_25d = args.model in IS_25D_MODELS
+    if use_25d:
+        train_loader, val_loader = get_dataloaders_25d(
+            args.data_dir,
+            cache_dir=args.cache_dir,
+            val_subjects=args.val_subjects,
+            val_start=args.val_start,
+            batch_size=args.batch_size,
+            num_workers=args.workers,
+            augment=True,
+            n_adj=5,
+        )
+    else:
+        train_loader, val_loader = get_dataloaders(
+            args.data_dir,
+            cache_dir=args.cache_dir,
+            val_subjects=args.val_subjects,
+            val_start=args.val_start,
+            batch_size=args.batch_size,
+            num_workers=args.workers,
+            augment=True,
+        )
 
     if args.val_subjects == 0:
         print("** COMPETITION MODE: training on ALL 18 subjects, no validation **")
@@ -234,7 +254,7 @@ def main():
     ).to(device)
     print(f"Loss: SSIM={args.ssim_w} L1={args.l1_w} Edge={args.edge_w} FFT={args.fft_w}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     # Warmup + cosine schedule
     warmup_epochs = 5
@@ -250,6 +270,8 @@ def main():
     # Train
     best_val = float("inf")
     save_name = args.model
+    if args.val_start >= 0:
+        save_name = f"{args.model}_split{args.val_start}"
     has_val = val_loader is not None
 
     print(f"\n{'Epoch':>5} | {'Train':>10} | {'Val':>10} | {'LR':>10} | {'Time':>6}")

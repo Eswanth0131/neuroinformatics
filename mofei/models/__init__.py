@@ -14,4 +14,8 @@ def get_model(name, **kwargs):
 
 from . import unet
 from . import unet_v2
+from . import unet_v3
+from . import unet_25d
+from . import smp_unet
+from . import nafnet
 from . import swinir
