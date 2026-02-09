@@ -379,3 +379,12 @@ Epoch |      Train |        Val |         LR |   Time
 Done. Best val loss: 0.126153
 
 Kaggle public score: 0.5049
+
+
+
+
+
+
+
+python3 train.py --model unet --data_dir ./data --epochs 150 --batch_size 64 --lr 1e-4 --val_subjects 0
+Kaggle public score: 0.5266
