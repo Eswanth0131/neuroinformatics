@@ -15,3 +15,4 @@ def get_model(name, **kwargs):
 
 # Import all model files so they self-register
 from . import unet
+from . import unet_v2

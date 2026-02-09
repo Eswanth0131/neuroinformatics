@@ -2,8 +2,8 @@
 Model-agnostic training loop.
 
 Usage:
-    python train.py --model unet --data_dir ./data --epochs 100
-    python train.py --model unet --data_dir ./data --epochs 200 --lr 3e-4 --batch_size 64
+    python train.py --model unet_v2 --data_dir ./data --epochs 200
+    python train.py --model unet_v2 --data_dir ./data --epochs 300 --lr 3e-4 --batch_size 64
 """
 
 import argparse
@@ -19,7 +19,7 @@ from dataset import get_dataloaders
 from models import get_model
 
 
-# ─── SSIM Loss ────────────────────────────────────────────────────────────────
+# ─── SSIM Loss (fp32-safe) ────────────────────────────────────────────────────
 
 def gaussian_kernel(size=11, sigma=1.5, channels=1):
     coords = torch.arange(size, dtype=torch.float32) - size // 2
@@ -30,18 +30,27 @@ def gaussian_kernel(size=11, sigma=1.5, channels=1):
 
 
 class SSIMLoss(nn.Module):
+    """SSIM loss that always computes in float32 for numerical stability."""
     def __init__(self, window_size=11, sigma=1.5):
         super().__init__()
         self.register_buffer("window", gaussian_kernel(window_size, sigma))
 
     def forward(self, pred, target):
+        # Force fp32 for stability
+        pred = pred.float()
+        target = target.float()
+        w = self.window
+
         C1, C2 = 0.01 ** 2, 0.03 ** 2
-        mu_p = F.conv2d(pred, self.window, padding=self.window.shape[-1] // 2, groups=1)
-        mu_t = F.conv2d(target, self.window, padding=self.window.shape[-1] // 2, groups=1)
+        pad = w.shape[-1] // 2
+
+        mu_p = F.conv2d(pred, w, padding=pad, groups=1)
+        mu_t = F.conv2d(target, w, padding=pad, groups=1)
         mu_pp, mu_tt, mu_pt = mu_p * mu_p, mu_t * mu_t, mu_p * mu_t
-        sigma_pp = F.conv2d(pred * pred, self.window, padding=self.window.shape[-1] // 2, groups=1) - mu_pp
-        sigma_tt = F.conv2d(target * target, self.window, padding=self.window.shape[-1] // 2, groups=1) - mu_tt
-        sigma_pt = F.conv2d(pred * target, self.window, padding=self.window.shape[-1] // 2, groups=1) - mu_pt
+
+        sigma_pp = F.conv2d(pred * pred, w, padding=pad, groups=1) - mu_pp
+        sigma_tt = F.conv2d(target * target, w, padding=pad, groups=1) - mu_tt
+        sigma_pt = F.conv2d(pred * target, w, padding=pad, groups=1) - mu_pt
 
         ssim = ((2 * mu_pt + C1) * (2 * sigma_pt + C2)) / \
                ((mu_pp + mu_tt + C1) * (sigma_pp + sigma_tt + C2))
@@ -69,9 +78,13 @@ def train_one_epoch(model, loader, optimizer, scaler, loss_fn, device):
     for low, high in loader:
         low, high = low.to(device), high.to(device)
         optimizer.zero_grad(set_to_none=True)
+
         with autocast("cuda", dtype=torch.bfloat16):
             pred = model(low)
-            loss = loss_fn(pred, high)
+
+        # Loss in fp32 (SSIM needs it, and it's cheap)
+        loss = loss_fn(pred.float(), high.float())
+
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -89,7 +102,7 @@ def validate(model, loader, loss_fn, device):
         low, high = low.to(device), high.to(device)
         with autocast("cuda", dtype=torch.bfloat16):
             pred = model(low)
-            loss = loss_fn(pred, high)
+        loss = loss_fn(pred.float(), high.float())
         total_loss += loss.item() * low.size(0)
     return total_loss / len(loader.dataset)
 
@@ -100,16 +113,16 @@ def main():
     parser.add_argument("--data_dir", type=str, default="./data")
     parser.add_argument("--cache_dir", type=str, default="./cache")
     parser.add_argument("--run_dir", type=str, default="./runs")
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--val_subjects", type=int, default=2)
-    parser.add_argument("--ssim_weight", type=float, default=0.5)
+    parser.add_argument("--ssim_weight", type=float, default=0.3)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--compile", action="store_true", help="torch.compile the model")
+    parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     args = parser.parse_args()
 
-    # Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.run_dir, exist_ok=True)
 
@@ -126,6 +139,10 @@ def main():
 
     # Model
     model = get_model(args.model)
+    if args.resume:
+        model.load_state_dict(torch.load(args.resume, map_location=device, weights_only=True))
+        print(f"Resumed from {args.resume}")
+
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model: {args.model} ({n_params:,} params)")
 
@@ -140,8 +157,17 @@ def main():
 
     # Loss, optimizer, scheduler
     loss_fn = CombinedLoss(ssim_weight=args.ssim_weight).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+
+    # Warmup + cosine schedule
+    warmup_epochs = 5
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(1, args.epochs - warmup_epochs)
+        return 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)).item())
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler = GradScaler("cuda")
 
     # Train
@@ -168,8 +194,8 @@ def main():
             torch.save(state, path)
             print(f"  ↳ Saved best model (val={best_val:.6f})")
 
-        # Save periodic checkpoint
-        if epoch % 25 == 0:
+        # Periodic checkpoint
+        if epoch % 50 == 0:
             state = model.module.state_dict() if isinstance(model, DataParallel) else model.state_dict()
             path = os.path.join(args.run_dir, f"{save_name}_ep{epoch}.pt")
             torch.save(state, path)
