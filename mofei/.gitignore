@@ -1,0 +1,6 @@
+data
+cache
+__pycache__
+runs
+*.txt
+*.csv
