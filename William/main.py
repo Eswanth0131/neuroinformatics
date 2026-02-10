@@ -1,159 +1,134 @@
-from extract_slices import create_submission_df, load_nifti, base64_to_slice
-from metric import score
-import os
-import re
-import sys
-import torch
-from torch.utils.data import Dataset, DataLoader
-import torch.nn as nn
-import numpy as np
 import pandas as pd
-import nibabel as nib
-from bids import BIDSLayout
 from tqdm import tqdm
-import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-def create_dataframe(train_folder_path = 'data/kaggle/train'):
-    # NOTE: There are no target labels for the kaggle test dataset
-    """
-    For a given slice in the low field MRI, the pandas dataframe of this dataset matches with one picture in the high field MRI. There are more slices in the high field than the low field in the kaggle dataset. Run "python main.py" to see.
+from dataset import *
+from models.m1_model import UpsampleCNN
+from models.m2_model import ImageUpscaler
+from models.m3_model import SRCNN
 
-    Example: index z=0 in low field is matched with z=0 in heigh field, index z=1 in low field is matched with z=5 in heigh field, ... 
-    """
-    high_dir = os.path.join(train_folder_path, 'high_field')
-    low_dir = os.path.join(train_folder_path, 'low_field')
+# PATH = '/home/wmz2007/'
+PATH = './'
+
+class SRCNN_loss():
+    def __init__(self):
+        super(SRCNN_loss, self).__init__()
     
-    # high_paths = os.listdir(high_dir)
-    low_files = os.listdir(low_dir)
+    def forward(self, x, y):
+        h_diff = abs(x.shape[2] - y.shape[2])
+        w_diff = abs(x.shape[3] - y.shape[3])
+        w_margin = w_diff // 2
+        h_margin = h_diff // 2
+        y_sub_img = y[:, :, w_margin:(y.shape[2] - w_margin) , h_margin:(y.shape[3] - h_margin)]
+        return torch.square(y_sub_img - x).sum()
+    
+    def __call__(self, *args, **kwds):
+        return self.forward(*args, **kwds)
 
-    sample_l = []
-    layer_l = []
-    img_l = []
+def train_loop(dataloader, device, model, loss_fn, optimizer, batch_size):
+    size = len(dataloader.dataset)
+    # Set the model to training mode - important for batch normalization and dropout layers
+    # Unnecessary in this situation but added for best practices
+    model.train()
+    for batch, (X, y) in enumerate(dataloader):
+        pred = model(X.to(device))
+        # loss = loss_fn(pred, y.to(device))
+        loss = loss_fn.forward(pred, y.to(device))
 
-    sample_h = []
-    layer_h = []
-    img_h = []
+        # Backpropagation
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        if batch % 2 == 0: 
+            # Keep in mind how many batchs (number of enumerate) is tied to batch size in dataloader
+            loss, current = loss.item(), batch * batch_size + X.shape[0]
+            print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
 
-    for low_file in tqdm(low_files, position=0):
-        l_file_path = os.path.join(low_dir, low_file)
-        # sample_l.append(re.findall(r'(\d+)', low_file)[0])
-        temp_low_img = load_nifti(l_file_path)
-        for low_z in tqdm(range(temp_low_img.shape[2]), position=1, leave=False):
-            # Store the input in dataframe format
-            sample_l.append(re.findall(r'(\d+)', low_file)[0])
-            layer_l.append(low_z)
-            img_l.append(temp_low_img[:, :, low_z])
+def test_loop(dataloader, device, model, loss_fn):
+    # Set the model to evaluation mode - important for batch normalization and dropout layers
+    # Unnecessary in this situation but added for best practices
+    model.eval()
+    size = len(dataloader.dataset)
+    num_batches = len(dataloader)
+    test_loss, correct = 0, 0
 
-            # Find corresponding high sample input
-            high_file = low_file.replace('low', 'high')
-            h_file_path = os.path.join(high_dir, high_file)
-            temp_high_img = load_nifti(h_file_path)
-            sample_h.append(re.findall(r'(\d+)', high_file)[0])
-            # NOTE: This controls the mapping of input to target
-            high_z = temp_high_img.shape[2] // temp_low_img.shape[2] * low_z
-            layer_h.append(high_z)
-            img_h.append(temp_high_img[:, :, high_z])
+    # Evaluating the model with torch.no_grad() ensures that no gradients are computed during test mode
+    # also serves to reduce unnecessary gradient computations and memory usage for tensors with requires_grad=True
+    with torch.no_grad():
+        for X, y in dataloader:
+            pred = model(X.to(device))
+            test_loss += loss_fn(pred, y.to(device)).item()
+            # correct += (pred.argmax(1) == y.to(device)).type(torch.float).sum().item()
 
-    train_df = {
-        'sample_l' : sample_l,
-        'layer_l' : layer_l,
-        'img_l' : img_l,
+    test_loss /= num_batches
+    correct /= size
+    print(f"Avg loss: {test_loss:>8f} \n")
 
-        'sample_h' : sample_h,
-        'layer_h' : layer_h,
-        'img_h' : img_h,
-    }
-
-    return pd.DataFrame(train_df)
-
-class myDataset(Dataset):
-    def __init__(self, dataframe:pd.DataFrame, mode:str = 'train', train_test_split = [9, 1]):
-        """
-        mode : valid values is 'test' or 'train'
-        """
-        self.dataset = dataframe
-        self.mode = mode
-        self.train_test_split = train_test_split
-
-    def __len__(self):
-        # train 90 test 10 split
-        if self.mode == 'train':
-            return self.dataset.shape[0] // 10 * self.train_test_split[0]
-        else:
-            return self.dataset.shape[0] // 10 * self.train_test_split[1]
-
-    def __getitem__(self, index):
-        # input, target
-        input_img = self.dataset.iloc[index]['img_l']
-        target_img = self.dataset.iloc[index]['img_h']
-        input_img = input_img[np.newaxis, :]
-        target_img = target_img[np.newaxis, :]
-        # print(type(input_img))
-
-        # return input_img, target_img
-        return input_img.astype(np.float32), target_img.astype(np.float32)
-
-
+# Example usage and training setup
 if __name__ == "__main__":
-    """
-    'python main.py 1' to just see 1 low image vs 1 high images randomly, after matching
-    'python main.py 2' to just see 1 low image vs 1 high images randomly, with force reloading data
-    'python main.py 3' to run piplines
-    """
-    print(sys.argv)
-    if len(sys.argv) < 2:
-        sample = '13'
-        fig, ax = plt.subplots(2, 3)
-        low_path = f'./data/kaggle/train/low_field/sample_0{sample}_lowfield.nii'
-        high_path = f'./data/kaggle/train/high_field/sample_0{sample}_highfield.nii'
-        low_img = load_nifti(low_path)
-        high_img = load_nifti(high_path)
-        # low_mid = low_img.shape[2] // 2
-        # high_mid = high_img.shape[2] // 2
-        low_mid = 10
-        high_mid = int(high_img.shape[2] / low_img.shape[2] * low_mid)
-        # ax[0, 0].imshow(low_img[:, :, low_mid], cmap='gray')
-        ax[0, 0].imshow(low_img[:, :, low_mid])
-        for i in range(5):
-            # ax[((1 + i) // 3) % 2, (1 + i) % 3].imshow(high_img[:, :, high_mid + i], cmap='gray')
-            ax[((1 + i) // 3) % 2, (1 + i) % 3].imshow(high_img[:, :, high_mid + i])
+    
+    if sys.argv[1] == 'train':
+        # Create model
+        # model = ImageUpscaler(scale_factor=2, num_channels=1, num_residual_blocks=8, base_channels=64)
+        # model = UpsampleCNN()
+        model = SRCNN()
+        
+        # Get Data
+        dataset = pd.read_pickle('./data/misc/data.pkl')
+        input_image = dataset.loc[0, 'img_l']
+        train_dataset = myDataset(dataset)
+        test_dataset = myDataset(dataset, 'test')
 
-        print(f"low field image shape: {low_img.shape}\nhigh field image shape: {high_img.shape}\nlow field index: {low_mid}\nhigh field index: {high_mid}")
+        batch_size = 50
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True)
+        
+        # Training setup 
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = model.to(device)
+        
+        # Loss function (common choices for super-resolution)
+        # criterion = nn.MSELoss()
+        criterion = SRCNN_loss() #SRCNN Loss as in paper
+        
+        # Optimizer
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+        epochs = 10
+        for t in range(epochs):
+            print(f"Epoch {t+1}\n-------------------------------")
+            train_loop(train_loader, device, model, criterion, optimizer, batch_size)
+            test_loop(test_loader, device, model, criterion)
+        print("Done!")
+        torch.save(model.state_dict(), os.path.join(PATH, 'model1.pt'))
+
+    elif sys.argv[1] == 'sample':
+        # model = ImageUpscaler(scale_factor=2, num_channels=1, num_residual_blocks=8, base_channels=64)
+        # model.load_state_dict(torch.load(os.path.join(PATH, 'model1.pt'), weights_only=True))
+        model = SRCNN()
+        
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model.load_state_dict(torch.load(os.path.join(PATH, 'model1_colab.pt'), weights_only=True, map_location=device))
+        model.to(device)
+
+        dataset = pd.read_pickle('./data/misc/data.pkl')
+
+        train_dataset = myDataset(dataset)
+        test_dataset = myDataset(dataset, 'test')
+        
+        train_loader = DataLoader(train_dataset, batch_size=10, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=10, shuffle=True)
+
+        imgs, targets = next(iter(train_loader))
+        fig, ax = plt.subplots(3)
+        ax[0].imshow(imgs[0][0])
+        ax[1].imshow(targets[0][0])
+
+        output = model(imgs)[0, 0, :, :].detach().cpu()
+        print(imgs.shape, output.shape)
+        ax[2].imshow(output)
         plt.show()
-        sys.exit(0)
-
-    elif len(sys.argv) == 2:
-        # NOTE: There are no target labels for the kaggle test dataset
-        data_path = './data/misc/data.pkl'
-        print(os.getcwd(), not os.path.exists(data_path))
-        if not os.path.exists(data_path) or sys.argv[1] == '2':
-            data_df = create_dataframe()
-            data_df.to_pickle(data_path)
-        else:
-            data_df = pd.read_pickle(data_path)
-
-        if sys.argv[1] == '1' or sys.argv[1] == '2':
-            train_dataset = myDataset(data_df)
-            test_dataset = myDataset(data_df, 'test')
-            
-            train_loader = DataLoader(train_dataset, batch_size=10, shuffle=True)
-            test_loader = DataLoader(test_dataset, batch_size=10, shuffle=True)
-
-            imgs, targets = next(iter(train_loader))
-            fig, ax = plt.subplots(2)
-            ax[0].imshow(imgs[0])
-            ax[1].imshow(targets[0])
-            plt.show()
-
-        elif sys.argv[1] == '3':
-            train_dataset = myDataset(data_df)
-            test_dataset = myDataset(data_df, 'test')
-            
-            train_loader = DataLoader(train_dataset, batch_size=10, shuffle=True)
-            test_loader = DataLoader(test_dataset, batch_size=10, shuffle=True)
-            for batch, (X, y) in enumerate(train_loader):
-                print(batch)
-                print(X.shape, y.shape)
-                print(X.shape, type(X))
-
-            pass
+        
