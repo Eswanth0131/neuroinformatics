@@ -28,56 +28,19 @@ from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DataParallel
 
 from models import get_model
+from losses import FullLoss, SimpleLoss
 from dataset_ixi import get_ixi_dataloader
 
 # Import competition dataloaders
 from dataset import get_dataloaders
 from dataset_25d import get_dataloaders_25d
 
-IS_25D_MODELS = {"unet_25d", "smp_unet_25d", "nafnet_25d"}
-
-
-# ─── Loss (same as train.py) ────────────────────────────────────────────────
-
-class KaggleSSIMLoss(nn.Module):
-    def forward(self, pred, target):
-        pred_flat = pred.reshape(pred.shape[0], -1).float()
-        tgt_flat = target.reshape(target.shape[0], -1).float()
-        C1, C2 = 0.01**2, 0.03**2
-        mu_p, mu_t = pred_flat.mean(1, keepdim=True), tgt_flat.mean(1, keepdim=True)
-        var_p = ((pred_flat - mu_p)**2).mean(1, keepdim=True)
-        var_t = ((tgt_flat - mu_t)**2).mean(1, keepdim=True)
-        cov = ((pred_flat - mu_p) * (tgt_flat - mu_t)).mean(1, keepdim=True)
-        ssim = (2*mu_p*mu_t + C1) * (2*cov + C2) / ((mu_p**2 + mu_t**2 + C1) * (var_p + var_t + C2))
-        return (1 - ssim).mean()
-
-
-def sobel_edges(x):
-    kx = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32, device=x.device).view(1,1,3,3)
-    ky = kx.permute(0,1,3,2)
-    ex = F.conv2d(x, kx, padding=1)
-    ey = F.conv2d(x, ky, padding=1)
-    return torch.sqrt(ex**2 + ey**2 + 1e-6)
-
-
-def fft_loss(pred, target):
-    fp = torch.fft.rfft2(pred.float())
-    ft = torch.fft.rfft2(target.float())
-    return F.l1_loss(torch.abs(fp), torch.abs(ft))
-
-
-def combined_loss(pred, target, ssim_loss_fn, ssim_w=0.4, l1_w=0.3, edge_w=0.15, fft_w=0.15):
-    pred_f, tgt_f = pred.float(), target.float()
-    loss = ssim_w * ssim_loss_fn(pred_f, tgt_f)
-    loss += l1_w * F.l1_loss(pred_f, tgt_f)
-    loss += edge_w * F.l1_loss(sobel_edges(pred_f), sobel_edges(tgt_f))
-    loss += fft_w * fft_loss(pred_f, tgt_f)
-    return loss
+IS_25D_MODELS = {"unet_25d", "smp_unet_25d", "nafnet_25d", "smp_unet_v2_25d"}
 
 
 # ─── Training Loop ──────────────────────────────────────────────────────────
 
-def train_stage(model, loader, optimizer, scheduler, scaler, ssim_loss_fn,
+def train_stage(model, loader, optimizer, scheduler, scaler, loss_fn,
                 epochs, stage_name, save_prefix, device, val_loader=None):
     """Generic training loop for both pretrain and finetune stages."""
     best_val = float('inf')
@@ -98,7 +61,7 @@ def train_stage(model, loader, optimizer, scheduler, scaler, ssim_loss_fn,
 
             with autocast("cuda", dtype=torch.bfloat16):
                 pred = model(batch_low)
-                loss = combined_loss(pred, batch_high, ssim_loss_fn)
+                loss = loss_fn(pred, batch_high)
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -123,7 +86,7 @@ def train_stage(model, loader, optimizer, scheduler, scaler, ssim_loss_fn,
                     vl, vh = vl.to(device), vh.to(device)
                     with autocast("cuda", dtype=torch.bfloat16):
                         vp = model(vl)
-                        vl_loss = combined_loss(vp, vh, ssim_loss_fn)
+                        vl_loss = loss_fn(vp, vh)
                     val_loss += vl_loss.item()
             avg_val = val_loss / len(val_loader)
             val_str = f"{avg_val:.6f}"
@@ -176,6 +139,10 @@ def main():
     parser.add_argument("--val_subjects", type=int, default=2)
     parser.add_argument("--val_start", type=int, default=-1)
     parser.add_argument("--max_ixi_subjects", type=int, default=500)
+    parser.add_argument("--simple_loss", action="store_true",
+                        help="Use simple loss (no VGG perceptual, no multi-scale)")
+    parser.add_argument("--single_gpu", action="store_true",
+                        help="Force single GPU even if multiple available")
 
     args = parser.parse_args()
     os.makedirs("runs", exist_ok=True)
@@ -190,11 +157,20 @@ def main():
     print(f"Model: {args.model} ({n_params:,} params)")
 
     model = model.to(device)
-    if torch.cuda.device_count() > 1:
+    if torch.cuda.device_count() > 1 and not args.single_gpu:
         model = DataParallel(model)
         print(f"Using {torch.cuda.device_count()} GPUs")
+    else:
+        print(f"Using 1 GPU")
 
-    ssim_loss_fn = KaggleSSIMLoss()
+    # Loss
+    if args.simple_loss:
+        loss_fn = SimpleLoss().to(device)
+        print("Loss: SimpleLoss (MS-SSIM + L1 + gradient + FFT)")
+    else:
+        loss_fn = FullLoss(device)
+        print("Loss: FullLoss (MS-SSIM + L1 + gradient + FFT + perceptual + multi-scale)")
+
     scaler = GradScaler("cuda")
 
     # ── Stage 1: Pretrain on IXI ──
@@ -216,7 +192,7 @@ def main():
             )
 
             train_stage(
-                model, ixi_loader, optimizer, scheduler, scaler, ssim_loss_fn,
+                model, ixi_loader, optimizer, scheduler, scaler, loss_fn,
                 epochs=args.pretrain_epochs,
                 stage_name="PRETRAIN (IXI synthetic)",
                 save_prefix=f"{args.model}_pretrained",
@@ -267,7 +243,7 @@ def main():
     )
 
     train_stage(
-        model, train_loader, optimizer, scheduler, scaler, ssim_loss_fn,
+        model, train_loader, optimizer, scheduler, scaler, loss_fn,
         epochs=args.finetune_epochs,
         stage_name="FINETUNE (competition)",
         save_prefix=f"{args.model}_finetuned_split{args.val_start if args.val_start >= 0 else 'all'}",

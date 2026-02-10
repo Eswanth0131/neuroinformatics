@@ -19,3 +19,6 @@ from . import unet_25d
 from . import smp_unet
 from . import nafnet
 from . import swinir
+
+# All 2.5D models (used by train.py, infer.py, etc.)
+IS_25D_MODELS = {"unet_25d", "smp_unet_25d", "nafnet_25d", "smp_unet_v2_25d"}

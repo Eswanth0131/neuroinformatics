@@ -18,7 +18,7 @@ from torch.amp import autocast
 from dataset import preprocess_train, TARGET_SHAPE
 from models import get_model
 
-IS_25D_MODELS = {"unet_25d", "smp_unet_25d", "nafnet_25d"}
+IS_25D_MODELS = {"unet_25d", "smp_unet_25d", "nafnet_25d", "smp_unet_v2_25d"}
 
 
 def slice_to_base64(slice_2d):

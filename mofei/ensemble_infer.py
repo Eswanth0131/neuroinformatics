@@ -16,7 +16,7 @@ from dataset import preprocess_test, TARGET_SHAPE
 from extract_slices import create_submission_df
 from models import get_model
 
-IS_25D_MODELS = {"unet_25d", "smp_unet_25d", "nafnet_25d"}
+IS_25D_MODELS = {"unet_25d", "smp_unet_25d", "nafnet_25d", "smp_unet_v2_25d"}
 
 
 @torch.no_grad()
