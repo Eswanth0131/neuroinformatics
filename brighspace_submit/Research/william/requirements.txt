@@ -1,0 +1,12 @@
+numpy
+pandas
+pybids
+matplotlib
+nibabel
+tqdm
+ipykernel
+mamba_ssm
+timm
+einops
+pytorch-ignite 
+piq
